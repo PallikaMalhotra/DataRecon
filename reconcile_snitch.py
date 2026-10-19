@@ -5,214 +5,160 @@ from pathlib import Path
 
 import pandas as pd
 
-
-# ==================================================
-# 1. CONFIGURATION
-# ==================================================
-
 BASE_DIR = Path(__file__).resolve().parent
-
-DATA_FILE = (
-    BASE_DIR
-    / "data"
-    / "Snitch_Fashion_Sales_Uncleaned.csv"
-)
-
-DB_FILE = BASE_DIR / "datarecon_snitch.db"
+DATA_DIR = BASE_DIR / "data"
 REPORTS_DIR = BASE_DIR / "reports"
 
-ROW_KEY = "Recon_Row_ID"
+SOURCE_FILE = DATA_DIR / "Snitch_Fashion_Sales_Uncleaned.csv"
+TARGET_FILE = DATA_DIR / "target_sales.csv"
+DB_FILE = BASE_DIR / "datarecon_snitch.db"
 
-SALES_COLUMN = "Sales_Amount"
-DATE_COLUMN = "Order_Date"
-CATEGORY_COLUMN = "Product_Category"
-ORDER_COLUMN = "Order_ID"
+ORDER_COL = "Order_ID"
+DATE_COL = "Order_Date"
+CATEGORY_COL = "Product_Category"
+SALES_COL = "Sales_Amount"
 
 
-# ==================================================
-# 2. LOAD SOURCE DATA
-# ==================================================
+def load_csv(path):
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
 
-def load_source():
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(
-            f"Dataset not found: {DATA_FILE}"
-        )
-
-    df = pd.read_csv(DATA_FILE)
+    df = pd.read_csv(path)
+    df.columns = df.columns.astype(str).str.strip()
 
     if df.empty:
-        raise ValueError("Source dataset is empty.")
-
-    required_columns = [
-        ORDER_COLUMN,
-        DATE_COLUMN,
-        CATEGORY_COLUMN,
-        SALES_COLUMN,
-    ]
-
-    missing_columns = [
-        col for col in required_columns
-        if col not in df.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"Required columns missing: {missing_columns}"
-        )
-
-    # Create a stable key because Order_ID can repeat.
-    if ROW_KEY in df.columns:
-        df = df.drop(columns=[ROW_KEY])
-
-    df.insert(0, ROW_KEY, range(1, len(df) + 1))
+        raise ValueError(f"{path.name} contains no rows.")
 
     return df
 
 
-# ==================================================
-# 3. CREATE TARGET TEST DATA
-# ==================================================
+def prepare_data(df):
+    df = df.copy()
+    df.columns = df.columns.astype(str).str.strip()
 
-def create_test_target(source):
-    """
-    Create a target copy with controlled discrepancies.
-    The original CSV is never modified.
-    """
+    for col in [
+        ORDER_COL, CATEGORY_COL, "Customer_Name",
+        "Product_Name", "City", "Segment"
+    ]:
+        if col in df.columns:
+            df[col] = df[col].astype("string").str.strip()
 
-    target = source.copy()
+    df[SALES_COL] = pd.to_numeric(df[SALES_COL], errors="coerce")
 
-    # Test 1: Remove one record from target.
-    target = target[
-        target[ROW_KEY] != 10
-    ].copy()
+    df[DATE_COL] = pd.to_datetime(
+        df[DATE_COL],
+        format="mixed",
+        errors="coerce",
+        dayfirst=True
+    ).dt.strftime("%Y-%m-%d")
 
-    # Test 2: Change sales amount for another record.
-    mask = target[ROW_KEY] == 20
-
-    if mask.any():
-        old_value = pd.to_numeric(
-            target.loc[mask, SALES_COLUMN],
-            errors="coerce",
-        ).fillna(0)
-
-        target.loc[mask, SALES_COLUMN] = old_value + 25
-
-    # Test 3: Add one extra target record.
-    extra = source.iloc[[0]].copy()
-
-    extra[ROW_KEY] = int(
-        source[ROW_KEY].max()
-    ) + 1
-
-    target = pd.concat(
-        [target, extra],
-        ignore_index=True,
-    )
-
-    return target
+    return df
 
 
-# ==================================================
-# 4. RECORD-LEVEL RECONCILIATION
-# ==================================================
+def validate_columns(df, filename):
+    required = [ORDER_COL, DATE_COL, CATEGORY_COL, SALES_COL]
+    missing = [c for c in required if c not in df.columns]
+
+    if missing:
+        raise ValueError(
+            f"{filename} is missing {missing}. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+
+
 
 def reconcile(source, target):
-    source_ids = set(source[ROW_KEY])
-    target_ids = set(target[ROW_KEY])
+    source = source.copy().reset_index(drop=True)
+    target = target.copy().reset_index(drop=True)
 
-    # Records that exist only in source.
-    source_only_ids = sorted(
-        source_ids - target_ids
+    source.columns = source.columns.astype(str).str.strip()
+    target.columns = target.columns.astype(str).str.strip()
+
+    key_col = "Order_ID"
+
+    if key_col not in source.columns or key_col not in target.columns:
+        raise ValueError(
+            f"Source columns: {source.columns.tolist()}\n"
+            f"Target columns: {target.columns.tolist()}"
+        )
+
+    # Compare records by occurrence of Order_ID.
+    source["_occurrence"] = source.groupby(
+        key_col, dropna=False
+    ).cumcount()
+    target["_occurrence"] = target.groupby(
+        key_col, dropna=False
+    ).cumcount()
+
+    key_columns = [key_col, "_occurrence"]
+
+    # Reset the index after joining so Order_ID stays a normal column.
+    source_indexed = source.set_index(key_columns, drop=False)
+    target_indexed = target.set_index(key_columns, drop=False)
+
+    source_keys = set(source_indexed.index)
+    target_keys = set(target_indexed.index)
+
+    source_only_keys = source_keys - target_keys
+    target_only_keys = target_keys - source_keys
+    common_keys = source_keys & target_keys
+
+    source_only = (
+        source_indexed.loc[list(source_only_keys)]
+        .reset_index(drop=True)
+        if source_only_keys else source.iloc[0:0].copy()
     )
 
-    # Records that exist only in target.
-    target_only_ids = sorted(
-        target_ids - source_ids
+    target_only = (
+        target_indexed.loc[list(target_only_keys)]
+        .reset_index(drop=True)
+        if target_only_keys else target.iloc[0:0].copy()
     )
 
-    source_only = source[
-        source[ROW_KEY].isin(source_only_ids)
-    ].copy()
-
-    target_only = target[
-        target[ROW_KEY].isin(target_only_ids)
-    ].copy()
-
-    common_ids = sorted(
-        source_ids & target_ids
+    source_only = source_only.drop(
+        columns=["_occurrence"], errors="ignore"
     )
-
-    source_indexed = source.set_index(ROW_KEY)
-    target_indexed = target.set_index(ROW_KEY)
-
-    mismatch_records = []
+    target_only = target_only.drop(
+        columns=["_occurrence"], errors="ignore"
+    )
 
     compare_columns = [
         col for col in source.columns
-        if col != ROW_KEY
+        if col != "_occurrence" and col in target.columns
     ]
 
-    for row_id in common_ids:
+    mismatch_rows = []
+
+    for key in sorted(common_keys, key=str):
+        source_row = source_indexed.loc[key]
+        target_row = target_indexed.loc[key]
+
         for col in compare_columns:
+            a = source_row[col]
+            b = target_row[col]
 
-            source_value = source_indexed.at[
-                row_id, col
-            ]
-
-            target_value = target_indexed.at[
-                row_id, col
-            ]
-
-            # Both values missing means no mismatch.
-            if (
-                pd.isna(source_value)
-                and pd.isna(target_value)
-            ):
+            if pd.isna(a) and pd.isna(b):
                 continue
 
-            # Compare numeric values numerically.
-            source_num = pd.to_numeric(
-                pd.Series([source_value]),
-                errors="coerce",
-            ).iloc[0]
-
-            target_num = pd.to_numeric(
-                pd.Series([target_value]),
-                errors="coerce",
-            ).iloc[0]
-
-            if (
-                pd.notna(source_num)
-                and pd.notna(target_num)
-            ):
-                equal = source_num == target_num
+            if pd.isna(a) != pd.isna(b):
+                equal = False
             else:
-                equal = (
-                    str(source_value)
-                    == str(target_value)
-                )
+                equal = str(a).strip() == str(b).strip()
 
             if not equal:
-                mismatch_records.append({
-                    ROW_KEY: row_id,
+                mismatch_rows.append({
+                    "Order_ID": key[0],
+                    "occurrence": key[1],
                     "column_name": col,
-                    "source_value": (
-                        None
-                        if pd.isna(source_value)
-                        else str(source_value)
-                    ),
-                    "target_value": (
-                        None
-                        if pd.isna(target_value)
-                        else str(target_value)
-                    ),
+                    "source_value": None if pd.isna(a) else str(a),
+                    "target_value": None if pd.isna(b) else str(b),
                 })
 
     mismatches = pd.DataFrame(
-        mismatch_records,
+        mismatch_rows,
         columns=[
-            ROW_KEY,
+            "Order_ID",
+            "occurrence",
             "column_name",
             "source_value",
             "target_value",
@@ -222,372 +168,130 @@ def reconcile(source, target):
     return source_only, target_only, mismatches
 
 
-# ==================================================
-# 5. DATA QUALITY REPORTS
-# ==================================================
-
 def create_quality_reports(source):
-
-    # Missing values by column.
-    missing_records = []
-
-    for col in source.columns:
-        if col == ROW_KEY:
-            continue
-
-        missing_count = int(
-            source[col].isna().sum()
-        )
-
-        missing_records.append({
+    missing_report = pd.DataFrame([
+        {
             "column_name": col,
-            "missing_count": missing_count,
+            "missing_count": int(source[col].isna().sum()),
             "missing_percentage": round(
-                source[col].isna().mean() * 100,
-                2,
-            ),
-        })
+                source[col].isna().mean() * 100, 2
+            )
+        }
+        for col in source.columns
+    ]).sort_values("missing_count", ascending=False)
 
-    missing_report = pd.DataFrame(
-        missing_records
-    ).sort_values(
-        "missing_count",
-        ascending=False,
-    )
-
-    # Repeated order IDs. Do not assume they are invalid.
-    order_ids = (
-        source[ORDER_COLUMN]
-        .astype("string")
-        .str.strip()
-    )
-
-    valid_order_mask = (
-        order_ids.notna()
-        & order_ids.ne("")
-    )
-
-    valid_orders = source[
-        valid_order_mask
-    ].copy()
-
-    duplicate_report = (
-        valid_orders.groupby(ORDER_COLUMN)
-        .size()
+    ids = source[ORDER_COL].dropna()
+    duplicates = (
+        ids.value_counts()
+        .loc[lambda x: x > 1]
+        .rename_axis(ORDER_COL)
         .reset_index(name="row_count")
     )
 
-    duplicate_report = duplicate_report[
-        duplicate_report["row_count"] > 1
-    ].sort_values(
-        "row_count",
-        ascending=False,
-    )
-
-    return missing_report, duplicate_report
+    return missing_report, duplicates
 
 
-# ==================================================
-# 6. PREPARE ANALYTICAL COLUMNS
-# ==================================================
-
-def prepare_analytics(df):
-    result = df.copy()
-
-    result[SALES_COLUMN] = pd.to_numeric(
-        result[SALES_COLUMN],
-        errors="coerce",
-    )
-
-    result[DATE_COLUMN] = pd.to_datetime(
-        result[DATE_COLUMN],
-        errors="coerce",
-        dayfirst=True,
-    ).dt.strftime("%Y-%m-%d")
-
-    return result
-
-
-# ==================================================
-# 7. DAILY SALES RECONCILIATION
-# ==================================================
-
-def reconcile_daily_sales(source, target):
-    source = prepare_analytics(source)
-    target = prepare_analytics(target)
-
-    source_daily = (
-        source.groupby(
-            DATE_COLUMN,
-            dropna=False,
-        )[SALES_COLUMN]
+def aggregate_reconciliation(source, target, group_column):
+    source_totals = (
+        source.groupby(group_column, dropna=False)[SALES_COL]
         .sum(min_count=1)
         .rename("source_sales")
     )
-
-    target_daily = (
-        target.groupby(
-            DATE_COLUMN,
-            dropna=False,
-        )[SALES_COLUMN]
+    target_totals = (
+        target.groupby(group_column, dropna=False)[SALES_COL]
         .sum(min_count=1)
         .rename("target_sales")
     )
 
-    report = pd.concat(
-        [source_daily, target_daily],
-        axis=1,
-    )
-
+    report = pd.concat([source_totals, target_totals], axis=1)
     report["difference"] = (
-        report["target_sales"]
-        - report["source_sales"]
+        report["target_sales"] - report["source_sales"]
     )
-
     report["status"] = report["difference"].apply(
-        lambda value: (
-            "MATCH"
-            if pd.notna(value)
-            and abs(value) < 0.01
-            else "MISMATCH"
-        )
+        lambda x: "MATCH"
+        if pd.notna(x) and abs(x) < 0.01
+        else "MISMATCH"
     )
 
     return report.reset_index()
 
-
-# ==================================================
-# 8. CATEGORY-WISE SALES RECONCILIATION
-# ==================================================
-
-def reconcile_category_sales(source, target):
-    source = prepare_analytics(source)
-    target = prepare_analytics(target)
-
-    source_category = (
-        source.groupby(
-            CATEGORY_COLUMN,
-            dropna=False,
-        )[SALES_COLUMN]
-        .sum(min_count=1)
-        .rename("source_sales")
-    )
-
-    target_category = (
-        target.groupby(
-            CATEGORY_COLUMN,
-            dropna=False,
-        )[SALES_COLUMN]
-        .sum(min_count=1)
-        .rename("target_sales")
-    )
-
-    report = pd.concat(
-        [source_category, target_category],
-        axis=1,
-    )
-
-    report["difference"] = (
-        report["target_sales"]
-        - report["source_sales"]
-    )
-
-    report["status"] = report["difference"].apply(
-        lambda value: (
-            "MATCH"
-            if pd.notna(value)
-            and abs(value) < 0.01
-            else "MISMATCH"
-        )
-    )
-
-    return report.reset_index()
-
-
-# ==================================================
-# 9. MAIN PIPELINE
-# ==================================================
 
 def main():
-    REPORTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("Loading source dataset...")
+    source = prepare_data(load_csv(SOURCE_FILE))
+    target = prepare_data(load_csv(TARGET_FILE))
 
-    source = load_source()
+    validate_columns(source, SOURCE_FILE.name)
+    validate_columns(target, TARGET_FILE.name)
 
-    print(f"Source rows: {len(source)}")
-
-    print("Creating controlled target test data...")
-
-    target = create_test_target(source)
-
-    print("Running record-level reconciliation...")
-
-    source_only, target_only, mismatches = (
-        reconcile(source, target)
-    )
-
-    print("Running data quality checks...")
-
-    missing_report, duplicate_report = (
-        create_quality_reports(source)
-    )
-
-    print("Running daily sales reconciliation...")
-
-    daily_report = reconcile_daily_sales(
-        source,
-        target,
-    )
-
-    print("Running category sales reconciliation...")
-
-    category_report = reconcile_category_sales(
-        source,
-        target,
-    )
-
-    # Calculate overall sales totals.
-    source_sales = pd.to_numeric(
-        source[SALES_COLUMN],
-        errors="coerce",
-    ).sum(min_count=1)
-
-    target_sales = pd.to_numeric(
-        target[SALES_COLUMN],
-        errors="coerce",
-    ).sum(min_count=1)
-
-    sales_match = (
-        pd.notna(source_sales)
-        and pd.notna(target_sales)
-        and abs(source_sales - target_sales) < 0.01
-    )
-
-    # Store source and target in SQLite.
-    with sqlite3.connect(DB_FILE) as conn:
-        source.to_sql(
-            "source_sales",
-            conn,
-            if_exists="replace",
-            index=False,
+    if set(source.columns) != set(target.columns):
+        raise ValueError(
+            "Source and target columns differ.\n"
+            f"Source-only: {sorted(set(source.columns)-set(target.columns))}\n"
+            f"Target-only: {sorted(set(target.columns)-set(source.columns))}"
         )
 
-        target.to_sql(
-            "target_sales",
-            conn,
-            if_exists="replace",
-            index=False,
-        )
+    target = target[source.columns]
 
-    # Export reconciliation reports.
-    source_only.to_csv(
-        REPORTS_DIR / "source_only_records.csv",
-        index=False,
-    )
+    source_only, target_only, mismatches = reconcile(source, target)
+    missing, duplicates = create_quality_reports(source)
 
-    target_only.to_csv(
-        REPORTS_DIR / "target_only_records.csv",
-        index=False,
-    )
+    daily = aggregate_reconciliation(source, target, DATE_COL)
+    categories = aggregate_reconciliation(source, target, CATEGORY_COL)
 
-    mismatches.to_csv(
-        REPORTS_DIR / "field_mismatches.csv",
-        index=False,
-    )
+    source_total = source[SALES_COL].sum(min_count=1)
+    target_total = target[SALES_COL].sum(min_count=1)
 
-    missing_report.to_csv(
-        REPORTS_DIR / "missing_values_report.csv",
-        index=False,
-    )
-
-    duplicate_report.to_csv(
-        REPORTS_DIR / "duplicate_order_ids.csv",
-        index=False,
-    )
-
-    daily_report.to_csv(
-        REPORTS_DIR / "daily_sales_reconciliation.csv",
-        index=False,
-    )
-
-    category_report.to_csv(
-        REPORTS_DIR / "category_sales_reconciliation.csv",
-        index=False,
-    )
-
-    # Build summary.
     summary = {
         "source_rows": int(len(source)),
         "target_rows": int(len(target)),
-        "row_count_match": bool(
-            len(source) == len(target)
+        "row_count_match": bool(len(source) == len(target)),
+        "source_only_records": int(len(source_only)),
+        "target_only_records": int(len(target_only)),
+        "field_mismatch_count": int(len(mismatches)),
+        "source_sales_total": round(float(source_total), 2)
+            if pd.notna(source_total) else None,
+        "target_sales_total": round(float(target_total), 2)
+            if pd.notna(target_total) else None,
+        "sales_total_match": bool(
+            pd.notna(source_total) and pd.notna(target_total)
+            and abs(source_total - target_total) < 0.01
         ),
-        "source_only_records": int(
-            len(source_only)
-        ),
-        "target_only_records": int(
-            len(target_only)
-        ),
-        "field_mismatch_count": int(
-            len(mismatches)
-        ),
-        "source_sales_amount_total": (
-            round(float(source_sales), 2)
-            if pd.notna(source_sales)
-            else None
-        ),
-        "target_sales_amount_total": (
-            round(float(target_sales), 2)
-            if pd.notna(target_sales)
-            else None
-        ),
-        "sales_total_match": bool(sales_match),
-        "duplicate_order_id_groups": int(
-            len(duplicate_report)
-        ),
-        "rows_with_missing_values": int(
-            source.drop(columns=[ROW_KEY])
-            .isna()
-            .any(axis=1)
-            .sum()
-        ),
+        "duplicate_order_id_groups": int(len(duplicates)),
+        "rows_with_missing_values": int(source.isna().any(axis=1).sum()),
         "daily_groups_with_mismatch": int(
-            (daily_report["status"] == "MISMATCH").sum()
+            (daily["status"] == "MISMATCH").sum()
         ),
         "category_groups_with_mismatch": int(
-            (category_report["status"] == "MISMATCH").sum()
-        ),
-        "test_mode": True,
+            (categories["status"] == "MISMATCH").sum()
+        )
     }
 
-    with open(
-        REPORTS_DIR / "summary.json",
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            summary,
-            file,
-            indent=4,
-        )
+    with sqlite3.connect(DB_FILE) as conn:
+        source.to_sql("source_sales", conn, if_exists="replace", index=False)
+        target.to_sql("target_sales", conn, if_exists="replace", index=False)
 
-    print("\n========== RECONCILIATION SUMMARY ==========")
+    reports = {
+        "source_only_records.csv": source_only,
+        "target_only_records.csv": target_only,
+        "field_mismatches.csv": mismatches,
+        "missing_values_report.csv": missing,
+        "duplicate_order_ids.csv": duplicates,
+        "daily_sales_reconciliation.csv": daily,
+        "category_sales_reconciliation.csv": categories
+    }
+
+    for name, df in reports.items():
+        df.to_csv(REPORTS_DIR / name, index=False)
+
+    with open(REPORTS_DIR / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=4)
+
     print(json.dumps(summary, indent=4))
-
-    print("\n========== GENERATED REPORTS ==========")
-
-    for report_file in sorted(
-        REPORTS_DIR.iterdir()
-    ):
-        if report_file.is_file():
-            print(report_file.name)
-
-    print(f"\nSQLite database: {DB_FILE}")
-    print("Reconciliation completed successfully.")
+    print(f"\nDatabase: {DB_FILE}")
+    print(f"Reports: {REPORTS_DIR}")
+    print("Reconciliation completed.")
 
 
 if __name__ == "__main__":
