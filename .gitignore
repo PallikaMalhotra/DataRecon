@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+datarecon_snitch.db
+reports/
+.pytest_cache/
